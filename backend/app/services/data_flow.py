@@ -29,6 +29,95 @@ class FlowEffect:
 
 
 # ---------------------------------------------------------------------------
+# 衍生启效明细：手工启效与注册联动共用的一份稳定数据交接
+# ---------------------------------------------------------------------------
+
+# 规则行上落盘启效明细快照的键；与 triggered_by / awakened_by 一样属于行内簿记。
+ACTIVATION_DETAIL_KEY = "activation_detail"
+
+
+@dataclass(frozen=True)
+class DeriveActivationDetail:
+    """衍生规则启效时固化下来的输入/输出字段交接。
+
+    手工启效把它交给特征血缘确认，注册联动用它驱动时间窗口试算。
+    首次启效时写入规则行，之后编辑规则不覆盖：提交与启效并发时只记录
+    实际用于下游的那份字段，下游写入失败重试或回执丢失恢复时原样取用。
+    """
+    rule_id: int
+    rule_no: str      # 规则编号
+    input_feat: str   # 输入特征
+    output_feat: str  # 输出特征
+    func_name: str    # 衍生函数
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "rule_no": self.rule_no,
+            "input_feat": self.input_feat,
+            "output_feat": self.output_feat,
+            "func_name": self.func_name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DeriveActivationDetail":
+        return cls(
+            rule_id=int(data.get("rule_id", 0)),
+            rule_no=str(data.get("rule_no", "")),
+            input_feat=str(data.get("input_feat", "")),
+            output_feat=str(data.get("output_feat", "")),
+            func_name=str(data.get("func_name", "")),
+        )
+
+
+def read_activation_detail(rule_row: dict[str, Any]) -> DeriveActivationDetail:
+    """共用取数写法：按规则行当前字段读取衍生启效明细（注册联动驱动窗口试算用）。"""
+    return DeriveActivationDetail(
+        rule_id=int(rule_row.get("id", 0)),
+        rule_no=str(rule_row.get("规则编号", "")),
+        input_feat=str(rule_row.get("输入特征", "")),
+        output_feat=str(rule_row.get("输出特征", "")),
+        func_name=str(rule_row.get("衍生函数", "")),
+    )
+
+
+def activation_detail_for_handoff(rule_row: dict[str, Any]) -> DeriveActivationDetail:
+    """取实际交给下游的启效明细。
+
+    首次启效时把当前字段固化到规则行，之后（含编辑后恢复、下游失败重试）
+    一律沿用这份快照，不再重新读取规则当前字段。
+    """
+    snapshot = rule_row.get(ACTIVATION_DETAIL_KEY)
+    if isinstance(snapshot, dict):
+        try:
+            return DeriveActivationDetail.from_dict(snapshot)
+        except (TypeError, ValueError):
+            pass
+    detail = read_activation_detail(rule_row)
+    rule_row[ACTIVATION_DETAIL_KEY] = detail.as_dict()
+    return detail
+
+
+def find_accepted_lineage(detail: DeriveActivationDetail) -> dict[str, Any] | None:
+    """实际读取血缘链路，判断该规则的启效明细是否已被受理。
+
+    按触发源（triggered_by=derive_rule/<规则编号>）或上下游字段核对，
+    命中即视为已确认过的旧血缘，恢复时不再重复确认。
+    """
+    trigger_key = f"derive_rule/{detail.rule_no}"
+    for lrow in store.rows("feature_line"):
+        if lrow.get("status") != "已确认":
+            continue
+        if str(lrow.get("triggered_by", "")) == trigger_key:
+            return lrow
+        if (detail.input_feat
+                and str(lrow.get("上游特征", "")) == detail.input_feat
+                and str(lrow.get("下游特征", "")) == detail.output_feat):
+            return lrow
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 链路定义：每条链路 = path + trigger 函数
 # ---------------------------------------------------------------------------
 
@@ -62,27 +151,29 @@ def flow_reg_to_derive_to_window(feature_reg_id: int) -> list[FlowEffect]:
     # 查找关联的衍生规则并启效
     derive_rows = store.rows("derive_rule")
     for row in derive_rows:
-        if str(row.get("输入特征", "")) and feat_name in str(row.get("输入特征", "")):
+        detail = read_activation_detail(row)
+        if detail.input_feat and feat_name in detail.input_feat:
             if row.get("status") == "草稿":
                 row["status"] = "生效中"
                 row["pending"] = True
                 row["abnormal"] = False
+                # 启效时刻固化明细快照，作为本次窗口试算的稳定输入
+                detail = activation_detail_for_handoff(row)
                 effects.append(FlowEffect(
-                    "启效规则", "derive_rule", int(row.get("id", 0)),
-                    f"特征 {feat_no} 注册后联动启效衍生规则 {row.get('规则编号','')}",
+                    "启效规则", "derive_rule", detail.rule_id,
+                    f"特征 {feat_no} 注册后联动启效衍生规则 {detail.rule_no}",
                 ))
                 # 同时联动时间窗口
-                _window_compute_for_derived(row, feat_no, effects)
+                _window_compute_for_derived(detail, feat_no, effects)
 
     return effects
 
 
 def _window_compute_for_derived(
-    derive_row: dict[str, Any], source_feat_no: str, effects: list[FlowEffect]
+    detail: DeriveActivationDetail, source_feat_no: str, effects: list[FlowEffect]
 ):
-    """为已启效的衍生规则关联的时间窗口触发计算。"""
+    """窗口试算：用共用启效明细驱动已启效衍生规则关联的时间窗口。"""
     win_rows = store.rows("time_window")
-    output_feat = str(derive_row.get("输出特征", ""))
     for wrow in win_rows:
         if wrow.get("status") == "草稿":
             wrow["status"] = "计算中"
@@ -90,7 +181,7 @@ def _window_compute_for_derived(
             wrow["awakened_by"] = f"feature_reg/{source_feat_no}"
             effects.append(FlowEffect(
                 "启动计算", "time_window", int(wrow.get("id", 0)),
-                f"衍生规则 {derive_row.get('规则编号','')} 启效联动窗口 {wrow.get('模板编号','')} 启动计算",
+                f"衍生规则 {detail.rule_no} 启效联动窗口 {wrow.get('模板编号','')} 启动计算",
             ))
 
 
@@ -239,10 +330,18 @@ def flow_derive_to_lineage(derive_rule_id: int) -> list[FlowEffect]:
     if dr is None or dr.get("status") != "生效中":
         return effects
 
-    rule_no = str(dr.get("规则编号", ""))
-    input_feat = str(dr.get("输入特征", ""))
-    output_feat = str(dr.get("输出特征", ""))
-    func_name = str(dr.get("衍生函数", ""))
+    # 手工启效把固化的衍生启效明细交给血缘确认；恢复/重试沿用同一份快照
+    detail = activation_detail_for_handoff(dr)
+
+    # 实际读取血缘结果：已受理过的旧血缘只确认一次，恢复时跳过重复确认
+    accepted = find_accepted_lineage(detail)
+    if accepted is not None:
+        effects.append(FlowEffect(
+            "血缘已受理", "feature_line", int(accepted.get("id", 0)),
+            f"衍生规则 {detail.rule_no} 恢复提交：血缘链路 {accepted.get('链路编号','')} "
+            f"已受理启效明细（{detail.input_feat}→{detail.output_feat}），跳过重复确认",
+        ))
+        return effects
 
     # 自动推导血缘并确认
     line_rows = store.rows("feature_line")
@@ -250,15 +349,15 @@ def flow_derive_to_lineage(derive_rule_id: int) -> list[FlowEffect]:
         if lrow.get("status") == "自动推导":
             lrow["status"] = "已确认"
             lrow["pending"] = False
-            lrow["上游特征"] = input_feat
-            lrow["下游特征"] = output_feat
-            lrow["转换函数"] = func_name
+            lrow["上游特征"] = detail.input_feat
+            lrow["下游特征"] = detail.output_feat
+            lrow["转换函数"] = detail.func_name
             lrow["依赖深度"] = "1"
             lrow["最后更新"] = datetime.datetime.now().isoformat()
-            lrow["triggered_by"] = f"derive_rule/{rule_no}"
+            lrow["triggered_by"] = f"derive_rule/{detail.rule_no}"
             effects.append(FlowEffect(
                 "确认链路", "feature_line", int(lrow.get("id", 0)),
-                f"衍生规则 {rule_no} 启效后自动推导血缘 {input_feat}→{output_feat}",
+                f"衍生规则 {detail.rule_no} 启效后自动推导血缘 {detail.input_feat}→{detail.output_feat}",
             ))
             break
 
